@@ -47,6 +47,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/feedlat"
 	"github.com/ethereum/go-ethereum/internal/syncx"
 	"github.com/ethereum/go-ethereum/internal/version"
 	"github.com/ethereum/go-ethereum/log"
@@ -821,6 +822,7 @@ func (bc *BlockChain) SetHead(head uint64) error {
 			return fmt.Errorf("current block missing: #%d [%x..]", header.Number, header.Hash().Bytes()[:4])
 		}
 	}
+	feedlat.StampHead(header.Hash(), time.Now())
 	bc.chainHeadFeed.Send(ChainHeadEvent{Header: header})
 	return nil
 }
@@ -846,6 +848,7 @@ func (bc *BlockChain) SetHeadWithTimestamp(timestamp uint64) error {
 			return fmt.Errorf("current block missing: #%d [%x..]", header.Number, header.Hash().Bytes()[:4])
 		}
 	}
+	feedlat.StampHead(header.Hash(), time.Now())
 	bc.chainHeadFeed.Send(ChainHeadEvent{Header: header})
 	return nil
 }
@@ -1728,11 +1731,13 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	if err := blockBatch.Write(); err != nil {
 		log.Crit("Failed to write block into disk", "err", err)
 	}
+	feedlat.StampBatchWritten(block.Hash(), time.Now())
 	// Commit all cached state changes into underlying memory database.
 	root, stateUpdate, err := statedb.CommitWithUpdate(block.NumberU64(), bc.chainConfig.IsEIP158(block.Number()), bc.chainConfig.IsCancun(block.Number(), block.Time(), types.DeserializeHeaderExtraInformation(block.Header()).ArbOSFormatVersion))
 	if err != nil {
 		return err
 	}
+	feedlat.StampStateCommitted(block.Hash(), time.Now())
 	// Emit the state update to the state sizestats if it's active
 	if bc.stateSizer != nil {
 		bc.stateSizer.Notify(stateUpdate)
@@ -1842,6 +1847,22 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 // writeBlockAndSetHead is the internal implementation of WriteBlockAndSetHead.
 // This function expects the chain mutex to be held.
 func (bc *BlockChain) writeBlockAndSetHead(block *types.Block, receipts []*types.Receipt, logs []*types.Log, state *state.StateDB, emitHeadEvent bool) (status WriteStatus, err error) {
+	// feedlat early-publish (local experiment): on the canonical fast path,
+	// notify subscribers from the in-memory block BEFORE persisting it.
+	// Persistence follows synchronously below; state/RPC reads for this
+	// block land within the same sub-millisecond window.
+	earlyPublished := false
+	if block.ParentHash() == bc.CurrentBlock().Hash() {
+		bc.chainFeed.Send(ChainEvent{
+			Header:       block.Header(),
+			Receipts:     receipts,
+			Transactions: block.Transactions(),
+		})
+		if len(logs) > 0 {
+			bc.logsFeed.Send(logs)
+		}
+		earlyPublished = true
+	}
 	if err := bc.writeBlockWithState(block, receipts, state); err != nil {
 		return NonStatTy, err
 	}
@@ -1856,15 +1877,18 @@ func (bc *BlockChain) writeBlockAndSetHead(block *types.Block, receipts []*types
 
 	// Set new head.
 	bc.writeHeadBlock(block)
+	feedlat.StampHeadWritten(block.Hash(), time.Now())
 
-	bc.chainFeed.Send(ChainEvent{
-		Header:       block.Header(),
-		Receipts:     receipts,
-		Transactions: block.Transactions(),
-	})
+	if !earlyPublished {
+		bc.chainFeed.Send(ChainEvent{
+			Header:       block.Header(),
+			Receipts:     receipts,
+			Transactions: block.Transactions(),
+		})
 
-	if len(logs) > 0 {
-		bc.logsFeed.Send(logs)
+		if len(logs) > 0 {
+			bc.logsFeed.Send(logs)
+		}
 	}
 	// In theory, we should fire a ChainHeadEvent when we inject
 	// a canonical block, but sometimes we can insert a batch of
@@ -1872,6 +1896,7 @@ func (bc *BlockChain) writeBlockAndSetHead(block *types.Block, receipts []*types
 	// we will fire an accumulated ChainHeadEvent and disable fire
 	// event here.
 	if emitHeadEvent {
+		feedlat.StampHead(block.Hash(), time.Now())
 		bc.chainHeadFeed.Send(ChainHeadEvent{Header: block.Header()})
 	}
 	return CanonStatTy, nil
@@ -1946,6 +1971,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool, makeWitness 
 	// Fire a single chain head event if we've progressed the chain
 	defer func() {
 		if lastCanon != nil && bc.CurrentBlock().Hash() == lastCanon.Hash() {
+			feedlat.StampHead(lastCanon.Hash(), time.Now())
 			bc.chainHeadFeed.Send(ChainHeadEvent{Header: lastCanon.Header()})
 		}
 	}()
